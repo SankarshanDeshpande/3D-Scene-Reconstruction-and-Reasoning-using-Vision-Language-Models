@@ -360,3 +360,91 @@ room0 structure confirmed: color/ (.jpg), depth/ (.png, uint16 mm, 0 = invalid),
      graph (68 nodes after pruning invalid objects)
   8. Visualization (built here, not part of ConceptGraphs itself): point cloud → Poisson mesh →
      rendered in MeshLab for photorealistic output
+- **`build-scenegraph` completed successfully on room0**: 68 nodes, 48 edges. Relation pairs
+  (e.g. "wooden table, coffee table", "white couch, pillows", "chair, room with white walls")
+  are spatially/semantically plausible for a living-room scene, confirming the relation-extraction
+  stage is producing usable output, not just non-crashing output. This closes out the full
+  ConceptGraphs pipeline for room0 — all 4 stages (mapping, captioning, caption refinement,
+  scene-graph building) now verified working end-to-end via the local Ollama-backed pipeline.
+
+## Session: Post-midsem reconstruction quality investigation
+
+**Frame selection confirmed:** `Train_VGGT_4.ipynb` uses evenly-spaced sampling across the
+full 2000-frame trajectory (`idxs = round(i*(N-1)/(N_SAMPLES-1))`), endpoints included,
+matching the depth-eval script's convention. The actual `.ply` export code (trimesh-based)
+was located in `Train_VGGT_3.ipynb`, not `_4` as initially assumed.
+
+**Point-cloud orientation bug and fix:** VGGT reconstructs each scene in the first sampled
+camera's own reference frame, not a gravity-aligned world frame -- confirmed by all-axis
+extents being similar (no single "short" axis) rather than a real room's expected
+floor-plan-vs-height ratio. Fixed via RANSAC floor-plane detection + rotation to align the
+floor normal to +Y (`auto_orient_points`), applied to all 5 existing `.ply` files (originals
+backed up as `{scene}_original.ply`) and baked into `Train_VGGT_3.ipynb`'s export cells.
+
+**Chunked-inference bug (room2, 256-frame attempt):** splitting frames into independent
+`model.aggregator()` calls (to avoid GPU/shard-related kills) silently produced points in
+different, unrelated coordinate systems per chunk (each chunk's scale/pose is anchored
+independently -- confirmed by the depth-eval finding that VGGT's recovered scale varies
+2-3x across independent inference calls). Fixed via inter-chunk alignment: consecutive
+chunks overlap by 8 frames, and a robust Umeyama (rotation+scale+translation) transform
+solved from the overlap's duplicate reconstructions aligns each chunk to the previous one.
+Residuals: 0.005-0.037 m across 11 chunks (256 frames) -- confirms the fix works.
+
+**Chunk cache staleness bug:** the per-chunk cache (added for resumability against
+cluster-contention kills) was keyed only by scene name + chunk index, not by which actual
+frames were used -- a later run with different frame selection (FPS vs even-spaced, 128 vs
+256) silently reused stale chunks from an unrelated run, causing a shape-mismatch crash.
+Fixed by storing each chunk's global frame indices in its cache file and validating them
+against the current run's expected indices before trusting the cache.
+
+**HPC/cluster findings:** intermittent job kills during VGGT inference were NOT caused by
+GPU memory (confirmed via `nvidia-smi`: ~12GB/95GB used) or host RAM (`--mem` raised
+8G->32G with no effect). Root cause: severe multi-user contention on the `shard:H100:94`
+GRES pool on both `node1` and `node2` (82-90+ of 94 shard-units committed by other users
+at peak). Mitigated via per-chunk checkpointing (resume across retries) rather than fixed.
+
+**room2 coverage-gap diagnosis:** a persistent gap did NOT correspond to a camera-trajectory
+blind spot (coverage-check grid across the full 2000 frames showed the region observed from
+many angles). Region-specific diagnostic (comparing point survival at each filter stage in
+the correct, final oriented coordinate frame) showed: mean confidence in the gap region was
+3.897, barely above `CONF_THRES=3.0` (86% of raw points there fail confidence filtering);
+of those that pass, statistical outlier removal (global mean+2*std) then cut a further 79%,
+because the region's local point density is naturally lower than the room's dominant
+surfaces, and a globally-computed density threshold penalizes that unfairly.
+
+**Fix:** replaced global mean+2*std SOR with a percentile-based one (drop sparsest 2%
+globally), leaving `CONF_THRES` unchanged. Confirmed via the same region diagnostic: target
+region went from 779 to 1,374,494 points. Result saved as `room2_v2.ply` (not yet promoted
+over `room2.ply`). Reprocessing used only cached per-chunk data -- no GPU re-inference
+needed, since only the filtering step changed.
+
+**FPS (coverage-maximizing) frame selection tested and NOT adopted for room2:** selecting
+128 frames via farthest-point-sampling over GT camera poses reduced worst-case trajectory
+coverage gaps by 48-80% across all 5 scenes (a real, measured improvement over naive
+even-spacing), but for room2 specifically produced MORE visual noise without closing the
+persistent gap -- likely because FPS actively avoids near-duplicate viewpoints, reducing the
+multi-view redundancy that implicitly denoises overlapping observations. FPS index files
+were generated for all 5 scenes (`outputs/eval/{scene}_fps_indices.txt`) but are not
+currently used in any promoted point cloud.
+
+**Important correction -- room0_mesh.ply's actual pipeline stage:** confirmed by reading
+`scene.ipynb` in full that `room0_mesh.ply` is NOT a mesh of the raw VGGT point cloud. It is
+built from `objects` loaded via pickle from
+`room0/pcd_saves/full_pcd_none_overlap_maskconf0.95_simsum1.2_dbscan.1_merge20_masksub_post.pkl.gz`
+-- ConceptGraphs' per-object, multi-view-fused point clouds (the Semantic Understanding
+stage), unioned and Poisson-meshed. `pcd_saves/` exists only for room0; ConceptGraphs has
+not been run for room1, room2, office0, or office1. room0_mesh's visibly higher quality vs.
+room2's raw-pipeline mesh is a downstream-stage artifact, not evidence that room2's
+point-cloud filtering is deficient by comparison -- the two are not directly comparable.
+
+**Current file state:**
+- room0.ply, room1.ply, office0.ply, office1.ply: original 128-frame reconstructions,
+  reoriented, otherwise unchanged since midsem.
+- room2.ply: 256-frame, chunked+aligned, original (mean+2*std) SOR (39,315,361 points).
+- room2_v2.ply: same 256-frame base, percentile-based SOR (18,347,171 points) -- improved,
+  pending promotion.
+- room2_v2_mesh.ply: Poisson mesh of room2_v2.ply, topology-cleaned; scattered small gaps
+  remain and are expected at this pipeline stage.
+
+**Next steps:** run ConceptGraphs (GSA detection + object fusion) for room1, room2, office0,
+office1 to reach parity with room0's pipeline stage, before further point-cloud-level tuning.
