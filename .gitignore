@@ -17,3 +17,10 @@ __pycache__/
 # HPC logs
 *.out
 *.err
+
+# Cloned external repos — not project code, don't version
+repos/Grounded-Segment-Anything/
+repos/LLaVA/
+repos/chamferdist/
+repos/concept-graphs/
+repos/gradslam/
